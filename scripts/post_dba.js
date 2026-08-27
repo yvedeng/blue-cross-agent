@@ -63,6 +63,15 @@
 // panel — where publishing itself happens entirely in DBA's own UI, not
 // via anything this script submits on the user's behalf.
 //
+// Login persists across runs: after a successful login the browser's
+// cookies/localStorage are saved to .auth/dba.json (gitignored — this file
+// is a live session credential, never commit it), and the next run loads
+// it into a fresh browser context and verifies it's still valid
+// (isLoggedIn(), a real authenticated API call — not just "the file
+// exists") before deciding whether to show the login panel at all. This
+// means posting several products in one sitting only requires logging in
+// once, until the session actually expires.
+//
 // On success prints exactly: POSTED <listing_url>
 // On any failure prints:      ERROR <message>
 
@@ -271,12 +280,38 @@ const LOGIN_OVERLAY_MARKUP = withDragAndMinimize(
   `
 );
 
+// Real evidence of an authenticated session, not a guess at cookie names
+// or DOM structure (an earlier version of this script tried both and both
+// were unreliable — see the login-detection note in SKILL.md). This
+// endpoint only returns a real postal code for a logged-in account; an
+// unauthenticated request gets a non-200 or redirect.
+async function isLoggedIn(request) {
+  try {
+    const res = await request.get("https://www.dba.dk/recommerce/create/api/user/postalcode");
+    if (!res.ok()) return false;
+    const body = await res.json();
+    return Boolean(body?.postalCode);
+  } catch {
+    return false;
+  }
+}
+
 // Login can involve DBA navigating the page (redirects through id.dba.dk and
 // back), which destroys any pending page.evaluate()'s JS execution context
 // and would silently kill an in-page Promise. So this waits by polling a
 // Node-side flag set via an exposed function, and re-injects the overlay on
 // every navigation rather than relying on a single long-lived evaluate call.
-async function waitForLogin(page) {
+//
+// Skips the pause entirely when a session restored from a previous run's
+// saved storageState (see main()) is still valid — checked via
+// isLoggedIn(), not assumed just because a saved file exists (DBA sessions
+// expire).
+async function waitForLogin(page, request) {
+  if (await isLoggedIn(request)) {
+    console.log("Resumed a saved login session — no need to log in again.");
+    return;
+  }
+
   let loggedIn = false;
   await page.exposeFunction("dbaAgentLoginDone", () => {
     loggedIn = true;
@@ -820,18 +855,31 @@ async function main() {
     }
   }
 
+  // Session persistence: DBA login is saved to disk (cookies/localStorage,
+  // via Playwright's storageState) after a successful login so a second
+  // product posted in the same sitting doesn't need a second login. Never
+  // committed — see .gitignore. isLoggedIn() (called from waitForLogin)
+  // still verifies the restored session is actually valid rather than
+  // trusting the file's mere existence, since DBA sessions expire.
+  const authDir = path.join(__dirname, "..", ".auth");
+  const authFile = path.join(authDir, "dba.json");
+  const hasSavedSession = fs.existsSync(authFile);
+
   let browser;
 
   try {
     browser = await chromium.launch({ headless: false });
-    const context = await browser.newContext();
+    const context = await browser.newContext(hasSavedSession ? { storageState: authFile } : {});
     const page = await context.newPage();
     const request = context.request;
 
     await page.goto("https://www.dba.dk/");
-    console.log("Waiting for login (complete it in the browser window)...");
-    await waitForLogin(page);
+    console.log("Checking login status...");
+    await waitForLogin(page, request);
     console.log("Logged in.");
+
+    fs.mkdirSync(authDir, { recursive: true });
+    await context.storageState({ path: authFile });
 
     const { listingUrl } = await createAndPublishListing(page, request, product, postalCode);
 

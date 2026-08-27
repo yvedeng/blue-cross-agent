@@ -3,7 +3,6 @@
 This agent is skill-based. Use the smallest matching skill for each request:
 
 - `.claude/skills/add-product/SKILL.md`
-- `.claude/skills/edit-product/SKILL.md`
 - `.claude/skills/post-product/SKILL.md`
 - `.claude/skills/post-dba/SKILL.md`
 - `.claude/skills/post-facebook-marketplace/SKILL.md`
