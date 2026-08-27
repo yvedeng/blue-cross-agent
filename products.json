@@ -3,16 +3,29 @@
   "currency": "DKK",
   "products": [
     {
-      "id": "desk-kinnarps-havesaenkebord",
+      "id": "kinnarps_stort_haeve_saenkebord_med_mavebue",
       "title": "Kinnarps Stort Hæve-sænkebord med mavebue",
       "description": "Kinnarps Serie (T) elektrisk hæve-sænkebord på 180 x 90 cm, med birkefineret bordplade med mavebue. Mulighed for at justere højden fra 62-128 cm. Der er monteret 3 kabelføringer på bordpladen, hvoraf 2 er af lækkert mattet metal. Under bordpladen er monteret en praktisk kabelbakke og en praktisk kontorartikel-penneholder der kan skjules.",
       "price": 999,
       "images": [
-        "products/desk/img/desk.jpeg"
+        "products/kinnarps_stort_haeve_saenkebord_med_mavebue/img/1.jpeg",
+        "products/kinnarps_stort_haeve_saenkebord_med_mavebue/img/2.jpeg"
       ],
       "status": "new",
       "created_at": "2026-08-27T18:02:33Z",
-      "updated_at": "2026-08-27T18:02:33Z",
+      "updated_at": "2026-08-27T23:00:00Z",
+      "metadata": {
+        "dimensions_cm": {
+          "height": 128,
+          "width": 180,
+          "depth": 90
+        },
+        "brand": "Kinnarps",
+        "model": "Serie T",
+        "materials": ["birch veneer", "matte metal"],
+        "features": ["electric height adjustment", "cable management"],
+        "included_accessories": ["cable tray", "retractable pen holder"]
+      },
       "channels": {
         "dba": {
           "status": "not_posted",
@@ -35,6 +48,36 @@
           "channel": "dba",
           "timestamp": "2026-08-27T20:15:00Z",
           "summary": "scripts/post_dba.js not found in repo (MODULE_NOT_FOUND)"
+        },
+        {
+          "type": "product_edited",
+          "timestamp": "2026-08-27T21:40:00Z",
+          "fields_changed": ["metadata"],
+          "summary": "Added metadata.dimensions_cm predicted from description (height 128, width 180, depth 90 cm); no condition wording found in description, left unset."
+        },
+        {
+          "type": "product_edited",
+          "timestamp": "2026-08-27T21:55:00Z",
+          "fields_changed": ["metadata"],
+          "summary": "Extended metadata with brand (Kinnarps), model (Serie T), materials (birch veneer, matte metal), features (electric height adjustment, cable management), and included_accessories (cable tray, retractable pen holder), all predicted from the existing description text. Color and condition left unset — not explicitly stated."
+        },
+        {
+          "type": "product_edited",
+          "timestamp": "2026-08-27T22:40:00Z",
+          "fields_changed": ["id"],
+          "summary": "Renamed id from 'desk-kinnarps-havesaenkebord' to 'desk' at user's request. images path (products/desk/img/desk.jpeg) already matched the new id — no file move needed."
+        },
+        {
+          "type": "product_edited",
+          "timestamp": "2026-08-27T22:45:00Z",
+          "fields_changed": ["images"],
+          "summary": "Updated images from ['products/desk/img/desk.jpeg'] (no longer on disk) to the two images now present: products/desk/img/1.jpeg and products/desk/img/2.jpeg."
+        },
+        {
+          "type": "product_edited",
+          "timestamp": "2026-08-27T23:00:00Z",
+          "fields_changed": ["id", "images"],
+          "summary": "Renamed id from 'desk' to 'kinnarps_stort_haeve_saenkebord_med_mavebue' (snake_case of title, per new ID convention). Moved products/desk/img/ to products/kinnarps_stort_haeve_saenkebord_med_mavebue/img/ on disk and updated images to match."
         }
       ]
     }

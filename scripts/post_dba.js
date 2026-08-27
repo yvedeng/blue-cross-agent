@@ -1,24 +1,29 @@
-// Posts one listing to DBA.dk by driving DBA's own recommerce create-item
-// JSON API from an authenticated Playwright browser session.
+// Posts one listing to DBA.dk using a mix of DBA's own recommerce
+// create-item JSON API (for the steps that turned out to work reliably)
+// and driving DBA's real form/buttons directly for the steps that didn't.
 //
 // Usage: node scripts/post_dba.js '{"title":"...","description":"...","price":999,"images":["products/x/img/a.jpg"]}'
 //
 // Reverse-engineered from a real posting flow captured with Playwright's
-// network recorder (2026-08-27). The DBA "create listing" UI is a thin
-// client over a stable JSON API:
+// network recorder (2026-08-27), then corrected repeatedly by testing
+// against the live form as parts of the pure-API approach turned out not
+// to work in practice (see the two big notes below and the ones near
+// uploadImages()/fillRemainingFieldsViaForm() further down):
 //   - GET  /recommerce/create/api/user/postalcode        account default postal code
 //   - PUT  /recommerce/create/api/item/{id}/validate      creates the draft, returns missing fields
 //   - PUT  /recommerce/create/api/item/{id}               {commit:false, data:{address}} must happen
 //     at least once BEFORE the first image upload — uploading straight after
 //     validate returns HTTP 500.
-//   - POST /recommerce/create/api/image/{id}?type=&size=  raw image bytes as body -> {uri,height,width}
+//   - Image upload: driven through DBA's real file input, NOT a direct API
+//     call — see the note on uploadImages() for why.
 //   - POST /recommerce/create/api/predictions/categories/{id}   AI category suggestion from title/image
-//   - PUT  /recommerce/create/api/item/{id}               {commit, data:{...accumulated fields}}
-//     commit:false saves a draft and returns remaining `violations`;
-//     commit:true is the actual publish call.
-//   - POST /recommerce/delivery/api/delivery?finnkode={id}      {meetup, shipping}
-//   - POST /recommerce/choose-products/api/ordernow?adId={id}&productSpecificationUrns=...  listing tier
-//   - GET  /my-items/details/{id}/api/single?adId={id}    status polling (DRAFT -> PENDING -> ...)
+//   - Title/description/price/postal code: filled through DBA's real form
+//     fields, NOT a direct API draft-save call — see the note on
+//     fillRemainingFieldsViaForm() for why.
+//   - Publish: the user clicks DBA's own "Se forhåndsvisning" button and
+//     completes publishing themselves in DBA's UI; this script detects
+//     success by polling GET /my-items/details/{id}/api/single?adId={id}
+//     for the item's state leaving DRAFT.
 //
 // The item id itself is minted by DBA when the browser navigates to
 // /create-item/start (it redirects to /recommerce/create/{id}), not by an
@@ -32,24 +37,31 @@
 // sidesteps that: every input is a click or a form field in the browser
 // window the user is already looking at.
 //
-// Runs in two phases:
-//   Phase 1 — Discover (discoverFields): creates a throwaway scratch item
-//     to see what DBA actually wants for this product — its own AI category
-//     suggestion, and the category/dimensions/condition fields it requires.
-//     Every field is decided here: DBA's category suggestion is used
-//     automatically when available (or the user picks one by hand in DBA's
-//     real form if not); height/width/depth are guessed by parsing the
-//     product's own title/description text, condition defaults to "used,
-//     good condition" — both shown as editable inputs, not silently
-//     assumed. The scratch item is deleted once discovery is done.
-//   Phase 2 — Fill (fillAndPublish): with every field already decided,
-//     creates the real item and fills it in one pass via the API — no more
-//     field-collection prompts, only a final review panel with
-//     Publish/Cancel before the actual commit:true publish call.
+// Creates exactly one DBA item and fills it progressively — there is no
+// separate throwaway "discovery" item. An earlier version of this script
+// tried a two-item design (a scratch item to find out what DBA wants,
+// deleted afterward, then a second fresh item for the real listing) but
+// DBA's /create-item/start flow turned out to always resume the same one
+// in-progress draft per session rather than minting a genuinely new item
+// id on a second navigation — so the "fresh" second item was actually the
+// same item, sometimes already deleted, causing failures that looked like
+// unrelated bugs. Filling one real item from the start avoids that
+// scratch/collision problem entirely and matches how a human uses DBA's
+// own form anyway (one draft, filled in over several steps).
 //
-// The user is only interrupted at: login, and (during discovery only) the
-// item-details panel or a manual category pick if DBA had no suggestion.
-// Nothing publishes without an explicit click on the final review panel.
+// The flow: create the item, upload photos (needed before asking for a
+// category — DBA's classifier has nothing to look at otherwise), get
+// DBA's AI category suggestion (or let the user pick one by hand in DBA's
+// real form if there's no suggestion), collect height/width/depth/
+// condition via an overlay panel (dimensions pre-filled by guessing from
+// the product's own title/description text), fill title/description/
+// price/postal code into DBA's real form, show a review panel, and wait
+// for the user to click "Se forhåndsvisning" and publish in DBA's own UI.
+//
+// The user is interrupted at: login, the item-details panel, (only if DBA
+// had no category suggestion) a manual category pick, and the final review
+// panel — where publishing itself happens entirely in DBA's own UI, not
+// via anything this script submits on the user's behalf.
 //
 // On success prints exactly: POSTED <listing_url>
 // On any failure prints:      ERROR <message>
@@ -68,6 +80,38 @@ const CONDITION_OPTIONS = [
 ];
 
 const DEFAULT_CONDITION_ID = 3; // "God, brugt stand" — the common case for a used marketplace listing
+
+// Maps products.json's channel-agnostic metadata.condition (set by
+// add-product from the description) to DBA's own condition ids.
+const CONDITION_LABEL_TO_ID = {
+  new: 1,
+  like_new: 2,
+  used_good: 3,
+  used_fair: 4,
+  worn: 5,
+};
+
+// Resolves the item-details panel's starting values in priority order:
+// 1. product.metadata (predicted by add-product from the description and
+//    stored in products.json — see add-product's Metadata section), so a
+//    prediction made once doesn't need to be re-derived on every post.
+// 2. A regex guess against the product's own title/description text.
+// 3. Left blank for the user to fill in.
+// Either way this is only ever a starting point — the panel always shows
+// editable inputs so the user can correct a wrong prediction or guess.
+function resolveInitialAttributes(product) {
+  const { title, description, metadata } = product;
+  const guessed = guessDimensionsFromText(`${title} ${description}`);
+
+  const dims = metadata?.dimensions_cm || {};
+  const height = dims.height ?? guessed.height;
+  const width = dims.width ?? guessed.width;
+  const depth = dims.depth ?? guessed.depth;
+
+  const condition = metadata?.condition ? CONDITION_LABEL_TO_ID[metadata.condition] ?? null : null;
+
+  return { height, width, depth, condition };
+}
 
 // Best-effort dimension extraction from free-text product copy (title +
 // description), so the item-details panel can arrive pre-filled instead of
@@ -150,37 +194,41 @@ function attachDragAndMinimizeSource() {
     <div class="panel-body">${bodyHtml}</div>
   `;
 
+  // Bound once per page (via a flag on window) rather than once per panel
+  // render — el.innerHTML gets replaced on every showStatus()/panel
+  // transition on the same reused overlay div, which would otherwise
+  // re-attach these document-level mousemove/mouseup listeners every time
+  // and accumulate duplicates with stale closures over a long run.
   window.__dbaAgentAttachDragAndMinimize = (el) => {
     const handle = el.querySelector("#dba-agent-drag-handle");
     const minimizeBtn = el.querySelector("#dba-agent-minimize");
 
-    minimizeBtn.addEventListener("click", () => {
+    minimizeBtn.onclick = () => {
       el.classList.toggle("minimized");
       minimizeBtn.innerHTML = el.classList.contains("minimized") ? "&#43;" : "&#8211;";
-    });
+    };
 
-    let dragging = false;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    handle.addEventListener("mousedown", (e) => {
+    handle.onmousedown = (e) => {
       if (e.target === minimizeBtn) return;
-      dragging = true;
+      window.__dbaAgentDragState = { dragging: true, el, offsetX: e.clientX, offsetY: e.clientY };
       const rect = el.getBoundingClientRect();
-      offsetX = e.clientX - rect.left;
-      offsetY = e.clientY - rect.top;
+      window.__dbaAgentDragState.offsetX = e.clientX - rect.left;
+      window.__dbaAgentDragState.offsetY = e.clientY - rect.top;
       el.style.right = "auto";
-    });
+    };
 
-    document.addEventListener("mousemove", (e) => {
-      if (!dragging) return;
-      el.style.left = `${e.clientX - offsetX}px`;
-      el.style.top = `${e.clientY - offsetY}px`;
-    });
-
-    document.addEventListener("mouseup", () => {
-      dragging = false;
-    });
+    if (!window.__dbaAgentDragListenersBound) {
+      window.__dbaAgentDragListenersBound = true;
+      document.addEventListener("mousemove", (e) => {
+        const state = window.__dbaAgentDragState;
+        if (!state?.dragging) return;
+        state.el.style.left = `${e.clientX - state.offsetX}px`;
+        state.el.style.top = `${e.clientY - state.offsetY}px`;
+      });
+      document.addEventListener("mouseup", () => {
+        if (window.__dbaAgentDragState) window.__dbaAgentDragState.dragging = false;
+      });
+    }
   };
 }
 
@@ -218,7 +266,7 @@ const LOGIN_OVERLAY_MARKUP = withDragAndMinimize(
   "Blue Cross Agent",
   `
     <div class="hint">Step 1 of 2 — Log in</div>
-    <div class="hint">Log in to DBA in this window (or resume an existing session), then click below. Next, the agent will figure out what DBA needs for this item (category, dimensions, condition) using a throwaway scratch draft, before creating and filling in the real listing.</div>
+    <div class="hint">Log in to DBA in this window (or resume an existing session), then click below. Next, the agent will create the listing draft, upload photos, ask DBA to suggest a category, and collect a few remaining details from you.</div>
     <button class="primary" id="dba-agent-login-done">I'm logged in, continue</button>
   `
 );
@@ -303,21 +351,35 @@ async function resolveCategory(page, request, itemId, title) {
 // category id has been saved, then reads it back.
 async function waitForManualCategoryPick(page, request, itemId) {
   await injectOverlay(page);
-  await page.evaluate(() => {
-    if (document.getElementById("dba-agent-overlay")) return;
-    const el = document.createElement("div");
-    el.id = "dba-agent-overlay";
-    el.innerHTML = window.__dbaAgentWithDragAndMinimize(
-      "Pick a category",
-      `
-        <div class="hint">Step 2 of 2 — Discovery: category (manual)</div>
-        <div class="hint">DBA's AI classifier had no automatic suggestion for this item. Use the Hovedkategori/Underkategori/Produktkategori dropdowns on this page directly (drag this panel out of the way if needed). This is a throwaway scratch draft, not the real listing — it will be deleted once discovery is done.</div>
-        <div class="hint">This panel is just watching — it will detect your selection and continue automatically once a valid category is saved. No need to click anything here.</div>
-      `
-    );
-    document.body.appendChild(el);
-    window.__dbaAgentAttachDragAndMinimize(el);
-  });
+  try {
+    await page.evaluate(() => {
+      if (typeof window.__dbaAgentWithDragAndMinimize !== "function") {
+        throw new Error("overlay helper functions not found on window — injectOverlay may not have run on this page");
+      }
+      // Reuse the overlay div if one already exists (e.g. a transient
+      // showStatus() status line) rather than skipping — an earlier bug
+      // here silently left a stale status overlay in place forever because
+      // it bailed out on seeing any existing #dba-agent-overlay element.
+      let el = document.getElementById("dba-agent-overlay");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "dba-agent-overlay";
+        document.body.appendChild(el);
+      }
+      el.innerHTML = window.__dbaAgentWithDragAndMinimize(
+        "Pick a category",
+        `
+          <div class="hint">Step 2 of 2 — Category (manual)</div>
+          <div class="hint">DBA's AI classifier had no automatic suggestion for this item. Use the Hovedkategori/Underkategori/Produktkategori dropdowns on this page directly (drag this panel out of the way if needed) — this is the real listing draft.</div>
+          <div class="hint">This panel is just watching — it will detect your selection and continue automatically once a valid category is saved. No need to click anything here.</div>
+        `
+      );
+      window.__dbaAgentAttachDragAndMinimize(el);
+    });
+  } catch (err) {
+    console.log(`WARNING failed to render 'Pick a category' overlay panel: ${err.message}`);
+    console.log("Continuing to poll for a manual category selection anyway — pick one in the visible DBA form.");
+  }
 
   for (;;) {
     const res = await request.put(`https://www.dba.dk/recommerce/create/api/item/${itemId}/validate`, {
@@ -336,9 +398,11 @@ async function waitForManualCategoryPick(page, request, itemId) {
   }
 }
 
-async function collectAttributes(page, title, description, categoryLabel) {
-  const guessed = guessDimensionsFromText(`${title} ${description}`);
-  const hasAnyGuess = guessed.height !== null || guessed.width !== null || guessed.depth !== null;
+async function collectAttributes(page, product, categoryLabel) {
+  const { title } = product;
+  const initial = resolveInitialAttributes(product);
+  const hasAnyValue = initial.height !== null || initial.width !== null || initial.depth !== null;
+  const fromMetadata = Boolean(product.metadata?.dimensions_cm || product.metadata?.condition);
 
   let submitted = null;
   await page.exposeFunction("dbaAgentAttributesSubmit", (values) => {
@@ -347,31 +411,42 @@ async function collectAttributes(page, title, description, categoryLabel) {
 
   await injectOverlay(page);
   await page.evaluate(
-    ({ title, categoryLabel, conditionOptions, guessed, hasAnyGuess, defaultConditionId }) => {
-      const el = document.createElement("div");
-      el.id = "dba-agent-overlay";
+    ({ title, categoryLabel, conditionOptions, initial, hasAnyValue, fromMetadata, defaultConditionId }) => {
+      // Reuse any existing overlay div (e.g. a transient showStatus() line)
+      // instead of appending a second element with the same id.
+      let el = document.getElementById("dba-agent-overlay");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "dba-agent-overlay";
+        document.body.appendChild(el);
+      }
+      const selectedCondition = initial.condition ?? defaultConditionId;
+      let sourceHint;
+      if (fromMetadata) {
+        sourceHint = "Pre-filled from products.json's predicted metadata — check these before continuing.";
+      } else if (hasAnyValue) {
+        sourceHint =
+          "Pre-filled by guessing from the product's own title/description — check these before continuing, DBA needs them but they aren't tracked in products.json.";
+      } else {
+        sourceHint = "Couldn't determine these from the product data — please fill them in.";
+      }
       el.innerHTML = window.__dbaAgentWithDragAndMinimize(
         "Item details",
         `
-          <div class="hint">Step 2 of 2 — Discovery: item details</div>
+          <div class="hint">Step 2 of 2 — Item details</div>
           <div class="hint">Listing: "${title}"</div>
           <div class="hint">Category: ${categoryLabel}</div>
-          <div class="hint">${
-            hasAnyGuess
-              ? "Pre-filled by guessing from the product's own title/description — check these before continuing, DBA needs them but they aren't tracked in products.json."
-              : "Couldn't guess these from the product text — please fill them in."
-          } This is a throwaway scratch draft used only to figure out what DBA needs. After Continue, the agent deletes it and creates the real listing with these values.</div>
+          <div class="hint">${sourceHint} After Continue, the agent will save the draft and show a final review before publishing.</div>
           <div class="row">
-            <div><label>Højde (cm)</label><input id="dba-agent-height" type="number" value="${guessed.height ?? ""}" /></div>
-            <div><label>Bredde (cm)</label><input id="dba-agent-width" type="number" value="${guessed.width ?? ""}" /></div>
-            <div><label>Dybde (cm)</label><input id="dba-agent-depth" type="number" value="${guessed.depth ?? ""}" /></div>
+            <div><label>Højde (cm)</label><input id="dba-agent-height" type="number" value="${initial.height ?? ""}" /></div>
+            <div><label>Bredde (cm)</label><input id="dba-agent-width" type="number" value="${initial.width ?? ""}" /></div>
+            <div><label>Dybde (cm)</label><input id="dba-agent-depth" type="number" value="${initial.depth ?? ""}" /></div>
           </div>
           <label>Stand (condition)</label>
           <select id="dba-agent-condition">
             ${conditionOptions
               .map(
-                (o) =>
-                  `<option value="${o.id}" ${o.id === defaultConditionId ? "selected" : ""}>${o.label}</option>`
+                (o) => `<option value="${o.id}" ${o.id === selectedCondition ? "selected" : ""}>${o.label}</option>`
               )
               .join("")}
           </select>
@@ -379,7 +454,6 @@ async function collectAttributes(page, title, description, categoryLabel) {
           <div class="warn" id="dba-agent-error" style="display:none"></div>
         `
       );
-      document.body.appendChild(el);
       window.__dbaAgentAttachDragAndMinimize(el);
 
       document.getElementById("dba-agent-continue").addEventListener("click", () => {
@@ -403,8 +477,9 @@ async function collectAttributes(page, title, description, categoryLabel) {
       title,
       categoryLabel,
       conditionOptions: CONDITION_OPTIONS,
-      guessed,
-      hasAnyGuess,
+      initial,
+      hasAnyValue,
+      fromMetadata,
       defaultConditionId: DEFAULT_CONDITION_ID,
     }
   );
@@ -415,20 +490,41 @@ async function collectAttributes(page, title, description, categoryLabel) {
   return submitted;
 }
 
-async function uploadImages(request, itemId, images) {
-  const uploaded = [];
-  for (const imagePath of images) {
-    const absolutePath = path.resolve(imagePath);
-    const bytes = fs.readFileSync(absolutePath);
-    const ext = path.extname(absolutePath).toLowerCase();
-    const mime = ext === ".png" ? "image/png" : "image/jpeg";
+// Uploads images through DBA's own "Tilføj billeder" file input rather
+// than calling the image API directly. Two direct-API approaches — the
+// standalone Playwright request client, and an in-page fetch() carrying
+// every browser-native header/cookie automatically — both got the same
+// unexplained, bodyless HTTP 500 on this endpoint, even with a request
+// byte-identical to the one known to work from an actual browser tab. That
+// rules out a missing header/auth difference; something about server-side
+// item state at that point must differ from a real user's flow. Driving
+// the real file input sidesteps the mystery entirely by doing exactly what
+// a human does — but each file still fires its own
+// POST /recommerce/create/api/image/{itemId} request under the hood (same
+// endpoint, same {uri,width,height} response shape as the original
+// capture), which this captures via waitForResponse rather than trusting
+// DBA's own frontend to expose the result any other way.
+async function uploadImages(page, itemId, images) {
+  const fileInput = page.locator('input[type="file"]').first();
+  const absolutePaths = images.map((imagePath) => path.resolve(imagePath));
 
-    const res = await request.post(
-      `https://www.dba.dk/recommerce/create/api/image/${itemId}?type=${encodeURIComponent(mime)}&size=${bytes.length}`,
-      { data: bytes, headers: { "content-type": mime } }
-    );
+  const responsesPromise = Promise.all(
+    images.map(() =>
+      page.waitForResponse(
+        (res) => res.url().includes(`/recommerce/create/api/image/${itemId}`) && res.request().method() === "POST",
+        { timeout: 30000 }
+      )
+    )
+  );
+
+  await fileInput.setInputFiles(absolutePaths);
+  const responses = await responsesPromise;
+
+  const uploaded = [];
+  for (const res of responses) {
     if (!res.ok()) {
-      throw new Error(`image upload failed for ${imagePath}: HTTP ${res.status()}`);
+      const bodyText = await res.text().catch(() => "");
+      throw new Error(`image upload failed via file input: HTTP ${res.status()} — ${bodyText.slice(0, 500)}`);
     }
     const body = await res.json();
     uploaded.push({ uri: body.data.uri, width: body.data.width, height: body.data.height, description: "" });
@@ -436,14 +532,63 @@ async function uploadImages(request, itemId, images) {
   return uploaded;
 }
 
-async function saveDraft(request, itemId, data) {
-  const res = await request.put(`https://www.dba.dk/recommerce/create/api/item/${itemId}`, {
-    data: { commit: false, data },
-  });
-  if (!res.ok()) {
-    throw new Error(`draft save failed: HTTP ${res.status()}`);
+// Tries a field by accessible label first, then by ARIA role+name as a
+// fallback (textbox covers title/description/postal code; spinbutton
+// covers numeric inputs like price) — DBA's exact markup for label
+// association isn't confirmed, so this doesn't assume getByLabel alone is
+// enough to find every field.
+async function fillFormField(page, name, value, { numeric = false } = {}) {
+  const candidates = [
+    page.getByLabel(name, { exact: false }),
+    page.getByRole(numeric ? "spinbutton" : "textbox", { name, exact: false }),
+  ];
+  for (const locator of candidates) {
+    if ((await locator.count()) > 0) {
+      await locator.first().fill(String(value));
+      return locator.first();
+    }
   }
-  return res.json();
+  throw new Error(`could not find a "${name}" field on DBA's form`);
+}
+
+// Fills title, description, price, postal code, dimensions, and condition
+// through DBA's own form fields rather than a direct API draft-save call.
+// After browser-driven image upload started succeeding (see uploadImages
+// above), the subsequent API draft-save (saveDraft) began failing with an
+// unexplained HTTP 400 — DBA's own frontend JS likely persists its own
+// draft revision right after a real upload, and a blind API overwrite
+// from a separate client conflicts with that state. Filling the rest of
+// the form the same way a human would (real inputs, DBA's own
+// "Se forhåndsvisning" button) avoids mixing two different clients'
+// writes against the same item.
+//
+// Height/width/depth/condition are collected earlier via the overlay
+// panel (collectAttributes) purely to decide what values to use — an
+// earlier version of this function forgot to actually write them into
+// DBA's Højde/Bredde/Dybde/Stand fields, silently leaving whatever DBA's
+// form already had there (e.g. stale values from a previous session
+// resuming the same in-progress draft) instead of the confirmed values.
+async function fillRemainingFieldsViaForm(page, product, postalCode, dimensions) {
+  const { title, description, price } = product;
+  const { height, width, depth, condition } = dimensions;
+
+  await fillFormField(page, "Annonceoverskrift", title);
+  await fillFormField(page, "Beskrivelse", description);
+  await fillFormField(page, "Pris", price, { numeric: true });
+  const postalInput = await fillFormField(page, "Postnummer", postalCode, { numeric: true });
+  await postalInput.press("Tab");
+
+  await fillFormField(page, "Højde", height, { numeric: true });
+  await fillFormField(page, "Bredde", width, { numeric: true });
+  await fillFormField(page, "Dybde", depth, { numeric: true });
+
+  const conditionOption = CONDITION_OPTIONS.find((o) => o.id === condition);
+  if (conditionOption) {
+    const standSelect = page.getByLabel("Stand", { exact: false });
+    if ((await standSelect.count()) > 0) {
+      await standSelect.selectOption({ label: conditionOption.label });
+    }
+  }
 }
 
 async function startNewDraft(page, request, postalCode) {
@@ -479,43 +624,50 @@ async function startNewDraft(page, request, postalCode) {
     data: { trade_type: "SELL" },
   });
 
-  // DBA's own flow saves an initial draft (address only) before it will
-  // accept an image upload for the item — skipping straight from validate
-  // to an image POST returns HTTP 500. Mirror that sequencing here. Only
-  // needed when this item will actually have images uploaded to it (the
-  // discovery-phase scratch item never does, so postalCode is null there
-  // and this step is skipped).
+  // DBA's own flow saves an initial draft before it will accept an image
+  // upload for the item — skipping straight from validate to an image POST
+  // returns HTTP 500. Mirror that sequencing here unconditionally.
+  const initialData = { trade_type: "SELL" };
   if (postalCode) {
-    await request.put(`https://www.dba.dk/recommerce/create/api/item/${itemId}`, {
-      data: { commit: false, data: { trade_type: "SELL", address: { postalcode: postalCode, country: "DK" } } },
-    });
+    initialData.address = { postalcode: postalCode, country: "DK" };
   }
+  await request.put(`https://www.dba.dk/recommerce/create/api/item/${itemId}`, {
+    data: { commit: false, data: initialData },
+  });
 
   return itemId;
 }
 
-async function reviewDraftWithUser(page, itemId, draftResult, fields) {
+// Shows a summary of everything the agent filled in and tells the user to
+// review it in the browser, click DBA's own "Se forhåndsvisning" button,
+// and complete publishing themselves from there — the agent doesn't drive
+// the preview/submit screens since their shape isn't known and clicking
+// blindly through an unfamiliar multi-step flow risks a worse outcome than
+// asking the user to finish it. This panel is a checkpoint, not a gate the
+// agent unlocks: the actual publish happens entirely in DBA's UI, and
+// waitForPublished() (called after this returns) is what detects it did.
+async function waitForPreviewConfirmation(page, itemId, fields) {
   const { title, price, postalCode, categoryId, categoryLabel, height, width, depth, condition, uploadedImages } =
     fields;
-  const remainingViolations = draftResult.violations || [];
 
-  let decision = null;
-  await page.exposeFunction("dbaAgentPublishDecision", (value) => {
-    decision = value;
+  let acknowledged = false;
+  await page.exposeFunction("dbaAgentPreviewAcknowledged", () => {
+    acknowledged = true;
   });
 
   await injectOverlay(page);
   await page.evaluate(
-    (
-      { itemId, title, price, postalCode, categoryId, categoryLabel, height, width, depth, condition, imageCount, violations }
-    ) => {
-      const el = document.createElement("div");
-      el.id = "dba-agent-overlay";
+    ({ itemId, title, price, postalCode, categoryId, categoryLabel, height, width, depth, condition, imageCount }) => {
+      let el = document.getElementById("dba-agent-overlay");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "dba-agent-overlay";
+        document.body.appendChild(el);
+      }
       el.innerHTML = window.__dbaAgentWithDragAndMinimize(
-        "Ready to publish",
+        "Review and publish",
         `
-          <div class="hint">Filling done — final review before publishing</div>
-          <div class="hint">This is the real listing draft (discovery's scratch draft was already deleted). The agent has filled everything below. Nothing has been published yet. Draft: https://www.dba.dk/recommerce/create/${itemId}</div>
+          <div class="hint">The agent has filled everything below. Draft: https://www.dba.dk/recommerce/create/${itemId}</div>
           <div><b>Title:</b> ${title}</div>
           <div><b>Price:</b> ${price} DKK</div>
           <div><b>Postal code:</b> ${postalCode}</div>
@@ -523,25 +675,15 @@ async function reviewDraftWithUser(page, itemId, draftResult, fields) {
           <div><b>Dimensions (HxWxD):</b> ${height}x${width}x${depth} cm</div>
           <div><b>Condition id:</b> ${condition}</div>
           <div><b>Images:</b> ${imageCount}</div>
-          ${
-            violations.length > 0
-              ? `<div class="warn">DBA reports unresolved fields: ${violations.map((v) => v.field).join(", ")}</div>`
-              : ""
-          }
-          <button class="primary" id="dba-agent-publish">Publish listing</button>
-          <button class="secondary" id="dba-agent-cancel">Cancel</button>
+          <div class="hint">Check everything in the browser, then click DBA's own "Se forhåndsvisning" button and complete publishing there yourself. Click below once you've published (or are done).</div>
+          <button class="primary" id="dba-agent-preview-done">I've published it</button>
         `
       );
-      document.body.appendChild(el);
       window.__dbaAgentAttachDragAndMinimize(el);
 
-      document.getElementById("dba-agent-publish").addEventListener("click", () => {
+      document.getElementById("dba-agent-preview-done").addEventListener("click", () => {
         el.remove();
-        window.dbaAgentPublishDecision(true);
-      });
-      document.getElementById("dba-agent-cancel").addEventListener("click", () => {
-        el.remove();
-        window.dbaAgentPublishDecision(false);
+        window.dbaAgentPreviewAcknowledged();
       });
     },
     {
@@ -556,79 +698,77 @@ async function reviewDraftWithUser(page, itemId, draftResult, fields) {
       depth,
       condition,
       imageCount: uploadedImages.length,
-      violations: remainingViolations,
     }
   );
 
-  while (decision === null) {
+  while (!acknowledged) {
     await page.waitForTimeout(500);
   }
-  return decision;
 }
 
-async function deleteItem(request, itemId) {
-  try {
-    await request.delete(`https://www.dba.dk/ads/${itemId}`);
-  } catch {
-    // best-effort cleanup; an abandoned scratch draft is harmless
+// Polls DBA's own item-status endpoint for confirmation the listing left
+// draft state — the same GET the original captured flow showed transition
+// from {"state":{"type":"DRAFT"}} to {"state":{"type":"PENDING"}} once a
+// real publish went through. This is how success is detected now that
+// publishing itself happens in DBA's UI rather than via an API commit:true
+// call this script makes directly.
+async function waitForPublished(itemId, request) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const res = await request.get(
+      `https://www.dba.dk/my-items/details/${itemId}/api/single?adId=${itemId}`
+    );
+    if (res.ok()) {
+      const body = await res.json();
+      const stateType = body?.state?.type;
+      if (stateType && stateType !== "DRAFT") {
+        return `https://www.dba.dk/my-items/details/${itemId}`;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
+  throw new Error(
+    `timed out waiting for DBA to show the listing as published (item ${itemId} still shows DRAFT after 5 minutes) — check the browser; if you did publish, the listing may still be fine, just re-check products.json manually`
+  );
 }
 
-// Phase 1 — Discover. Creates a throwaway scratch item purely to see what
-// DBA actually wants for this product (category suggestion, and whatever
-// the validate/draft-save `violations` reveal is still required once a
-// category is set), decides every field it can from the product's own
-// title/description, asks the user in-page for anything it can't, then
-// deletes the scratch item. Nothing here is the real listing.
-async function discoverFields(page, request, title, description) {
-  await showStatus(page, "Discovery: starting a scratch draft to see what DBA needs for this item…");
-  const scratchItemId = await startNewDraft(page, request, null);
+// Creates one DBA item and fills it end to end: upload photos, resolve
+// category (DBA's AI suggestion or a manual pick), collect
+// dimensions/condition, fill title/description/price/postal code into
+// DBA's real form, then wait for the user to review, click DBA's own
+// "Se forhåndsvisning" button, and publish in DBA's own UI. Returns
+// { listingUrl, fields } once waitForPublished() confirms the item left
+// draft state.
+async function createAndPublishListing(page, request, product, postalCode) {
+  const { title, price, images } = product;
 
-  await showStatus(page, "Discovery: asking DBA to suggest a category…");
-  const { categoryId, categoryLabel } = await resolveCategory(page, request, scratchItemId, title);
-
-  const { height, width, depth, condition } = await collectAttributes(page, title, description, categoryLabel);
-
-  await showStatus(page, "Discovery: cleaning up the scratch draft…");
-  await deleteItem(request, scratchItemId);
-
-  return { categoryId, categoryLabel, height, width, depth, condition };
-}
-
-// Phase 2 — Fill. All fields are already decided at this point; this
-// creates the real item and fills it in one pass via the API, with no more
-// field-collection panels — only the final publish confirmation remains.
-async function fillAndPublish(page, request, product, postalCode, fields) {
-  const { title, description, price, images } = product;
-  const { categoryId, categoryLabel, height, width, depth, condition } = fields;
-
-  await showStatus(page, "Starting the real listing draft…");
+  await showStatus(page, "Starting a new listing draft on DBA…");
   const itemId = await startNewDraft(page, request, postalCode);
   console.log(`DBA item id: ${itemId}`);
 
+  // Images are uploaded before asking for a category — DBA's AI classifier
+  // looks at the item's photo, not just its title, and returns no
+  // suggestion at all for an item with nothing uploaded yet.
   await showStatus(page, `Uploading ${images.length} photo(s)…`);
-  const uploadedImages = images.length > 0 ? await uploadImages(request, itemId, images) : [];
+  const uploadedImages = images.length > 0 ? await uploadImages(page, itemId, images) : [];
 
-  const data = {
-    trade_type: "SELL",
-    category: categoryId,
-    height,
-    width,
-    depth,
-    condition,
-    cartiresandrims: {},
-    title,
-    description,
-    price: { price_amount: price },
-    address: { postalcode: postalCode, country: "DK" },
-    image: uploadedImages,
-  };
+  await showStatus(page, "Asking DBA to suggest a category…");
+  const { categoryId, categoryLabel } = await resolveCategory(page, request, itemId, title);
 
-  await showStatus(page, "Saving draft…");
-  const draftResult = await saveDraft(request, itemId, data);
+  const { height, width, depth, condition } = await collectAttributes(page, product, categoryLabel);
 
-  console.log("Waiting for publish confirmation in the browser panel...");
-  const confirmed = await reviewDraftWithUser(page, itemId, draftResult, {
+  console.log(
+    `Resolved — category: ${categoryLabel} (id ${categoryId}), dimensions: ${height}x${width}x${depth} cm, condition id: ${condition}`
+  );
+  // Machine-parseable, printed as soon as these fields are known — before
+  // the draft save / publish steps that can still fail — so a caller can
+  // persist them into its own state even if the rest of this run fails.
+  console.log(`FIELDS ${JSON.stringify({ categoryId, categoryLabel, height, width, depth, condition })}`);
+
+  await showStatus(page, "Filling in the remaining fields…");
+  await fillRemainingFieldsViaForm(page, product, postalCode, { height, width, depth, condition });
+
+  await waitForPreviewConfirmation(page, itemId, {
     title,
     price,
     postalCode,
@@ -640,23 +780,14 @@ async function fillAndPublish(page, request, product, postalCode, fields) {
     condition,
     uploadedImages,
   });
-  if (!confirmed) {
-    throw new Error("user cancelled before publishing");
-  }
 
-  await showStatus(page, "Publishing…");
-  const publishRes = await request.put(`https://www.dba.dk/recommerce/create/api/item/${itemId}`, {
-    data: { commit: true, data },
-  });
-  if (!publishRes.ok()) {
-    throw new Error(`publish failed: HTTP ${publishRes.status()}`);
-  }
+  await showStatus(page, "Waiting for DBA to confirm the listing is published…");
+  const listingUrl = await waitForPublished(itemId, request);
 
-  await request.post(`https://www.dba.dk/recommerce/delivery/api/delivery?finnkode=${itemId}`, {
-    data: { meetup: true, shipping: false },
-  });
-
-  return `https://www.dba.dk/my-items/details/${itemId}`;
+  return {
+    listingUrl,
+    fields: { categoryId, categoryLabel, height, width, depth, condition },
+  };
 }
 
 async function main() {
@@ -674,7 +805,7 @@ async function main() {
     process.exit(1);
   }
 
-  const { title, description, images = [] } = product;
+  const { images = [] } = product;
   const postalCode = process.env.DBA_SELLER_POSTAL_CODE;
 
   if (!postalCode) {
@@ -702,21 +833,7 @@ async function main() {
     await waitForLogin(page);
     console.log("Logged in.");
 
-    console.log("Phase 1: discovering required fields via a scratch draft...");
-    const fields = await discoverFields(page, request, title, description);
-    console.log(
-      `Discovered — category: ${fields.categoryLabel} (id ${fields.categoryId}), ` +
-        `dimensions: ${fields.height}x${fields.width}x${fields.depth} cm, condition id: ${fields.condition}`
-    );
-    // Machine-parseable, printed unconditionally (before the fill/publish
-    // step that can still fail) so callers can persist the discovered
-    // fields back into their own state even on a failed run — discovery
-    // succeeding is real, reusable information regardless of what happens
-    // to the actual listing afterward.
-    console.log(`FIELDS ${JSON.stringify(fields)}`);
-
-    console.log("Phase 2: filling the real listing...");
-    const listingUrl = await fillAndPublish(page, request, product, postalCode, fields);
+    const { listingUrl } = await createAndPublishListing(page, request, product, postalCode);
 
     console.log(`POSTED ${listingUrl}`);
     await browser.close();
