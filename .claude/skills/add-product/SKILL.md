@@ -45,7 +45,6 @@ Product images live under `products/{id}/img/` — e.g. product id `desk` → `p
 - Before writing `images`, verify each path actually exists on disk (`find`/`ls` the folder) rather than assuming a filename — do not write a path for a file that isn't there.
 - Include every supported image file found in the folder (commonly `.jpg`/`.jpeg`/`.png`/`.webp`), not just the first one — a listing folder can hold several photos.
 - A product can be saved with an empty `images` array if the user explicitly declines to add any right now — don't block the whole add on images indefinitely; just don't silently skip asking.
-- If a product's `id` changes later (via `edit-product`), the `products/{id}/img/` folder does not rename itself — `edit-product` must reconcile `images` against whatever the folder is actually named at that point, not assume the old path pattern still resolves.
 
 ## Metadata (predicted, channel-agnostic)
 
