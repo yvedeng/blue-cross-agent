@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "currency": "DKK",
+  "products": [
+    {
+      "id": "desk-kinnarps-havesaenkebord",
+      "title": "Kinnarps Stort Hæve-sænkebord med mavebue",
+      "description": "Kinnarps Serie (T) elektrisk hæve-sænkebord på 180 x 90 cm, med birkefineret bordplade med mavebue. Mulighed for at justere højden fra 62-128 cm. Der er monteret 3 kabelføringer på bordpladen, hvoraf 2 er af lækkert mattet metal. Under bordpladen er monteret en praktisk kabelbakke og en praktisk kontorartikel-penneholder der kan skjules.",
+      "price": 999,
+      "images": [
+        "products/desk/img/desk.jpeg"
+      ],
+      "status": "new",
+      "created_at": "2026-08-27T18:02:33Z",
+      "updated_at": "2026-08-27T18:02:33Z",
+      "channels": {
+        "dba": {
+          "status": "not_posted",
+          "posted_at": null,
+          "listing_url": null
+        },
+        "facebook_marketplace": {
+          "status": "not_posted",
+          "posted_at": null,
+          "listing_url": null
+        }
+      },
+      "events": [
+        {
+          "type": "product_added",
+          "timestamp": "2026-08-27T18:02:33Z"
+        },
+        {
+          "type": "post_failed",
+          "channel": "dba",
+          "timestamp": "2026-08-27T20:15:00Z",
+          "summary": "scripts/post_dba.js not found in repo (MODULE_NOT_FOUND)"
+        }
+      ]
+    }
+  ]
+}
