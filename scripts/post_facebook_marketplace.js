@@ -1,6 +1,10 @@
 // Posts one listing to Facebook Marketplace via a headed Playwright browser.
 //
-// Usage: node scripts/post_facebook_marketplace.js '{"title":"...","description":"...","price":999,"images":["products/x/img/a.jpg"]}'
+// Usage: node scripts/post_facebook_marketplace.js '{"title":"...","description_da":"...","description_en":"...","price":999,"images":["products/x/img/a.jpg"]}'
+//
+// Facebook Marketplace has one description textbox, so description_da and
+// description_en are combined into a single field: Danish text, a blank
+// line, then English text.
 //
 // Pauses twice for the user at the keyboard:
 //   1. To log in to Facebook by hand, including any 2FA or checkpoint, and
@@ -60,7 +64,8 @@ async function main() {
     process.exit(1);
   }
 
-  const { title, description, price, images = [] } = product;
+  const { title, description_da, description_en, price, images = [] } = product;
+  const description = [description_da, description_en].filter(Boolean).join("\n\n");
 
   const warnings = [];
   let browser;

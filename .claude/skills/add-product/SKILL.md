@@ -10,21 +10,25 @@ Tools: Read and Write on `products.json`; AskUserQuestion for missing fields and
 ## Workflow
 
 1. Read `products.json`.
-2. Ask for the product `title`, `description`, and `price` if any are missing. Ask for currency only when it is not clear; default to the products currency when one exists.
+2. Ask for the product `title`, a `description`, and `price` if any are missing. The description can be given in either Danish or English — whichever the user finds natural. Ask for currency only when it is not clear; default to the products currency when one exists.
 3. Derive the `id` from `title` now (see "ID convention" below) — it's needed to name the image folder in the next step.
 4. Check whether `products/{id}/img/` already exists and has images in it (e.g. the user prepared a folder ahead of time). If it does, inspect it and include supported images. If it doesn't, create the empty folder and ask the user to add images to it, then wait for their confirmation before continuing — don't proceed with an empty `images` array without checking back, and don't guess filenames.
 5. Read the `title` and `description` closely, and look at any images now available, and predict as much `metadata` (see below) as the text and photos support together — dimensions, condition, brand, model, materials, color, features, and included accessories. Extract everything stated or clearly shown; don't stop at the first field found. Never invent a value that isn't implied by the text or visible in a photo, and omit any field neither source supports rather than guessing a placeholder.
-6. Propose an enriched rewrite of `description` (see "Description enrichment" below), drawing on both the text and the images, as a separate, clearly-labeled suggestion — never silently substitute it for what the user gave you.
+6. Propose an enriched rewrite of the description (see "Description enrichment" below), drawing on both the text and the images, as a separate, clearly-labeled suggestion — never silently substitute it for what the user gave you.
 7. Show a concise draft — the original description, the enriched rewrite as an opt-in alternative, and any predicted `metadata` — and ask the user to confirm, including which description (original or enriched) to save. Call out predicted fields explicitly as predictions so the user can correct them before they're saved.
-8. On confirmation, set `status` to `new`, set `created_at` and `updated_at` to the current ISO-8601 UTC time, initialize both channel records as `not_posted`, set `metadata` to whatever was predicted and confirmed (omit fields that weren't confidently predictable rather than storing null placeholders), and append a `product_added` event.
-9. Write the updated `products.json`.
-10. Report the new product ID, its `new` status, and any metadata that was predicted.
+8. Once the description to save is settled (original or enriched, in whichever language the user wrote or picked), translate it into the other of Danish/English — every product is stored in both languages regardless of which one the user supplied — and show both `description_da` and `description_en` for a final check before writing, since a translation can shift nuance the user should be able to catch. Keep both versions faithful to the same facts; translating is not a second opportunity to enrich or add claims.
+9. On confirmation, set `status` to `new`, set `created_at` and `updated_at` to the current ISO-8601 UTC time, initialize both channel records as `not_posted`, set `metadata` to whatever was predicted and confirmed (omit fields that weren't confidently predictable rather than storing null placeholders), and append a `product_added` event.
+10. Write the updated `products.json`.
+11. Report the new product ID, its `new` status, and any metadata that was predicted.
 
 ## Required fields
 
 - `title`: non-empty string
-- `description`: non-empty string
+- `description_da`: non-empty string (Danish)
+- `description_en`: non-empty string (English)
 - `price`: non-negative number
+
+Both description fields are required on every product — see workflow step 8. `products.json` has no single `description` field.
 
 ## ID convention
 
@@ -86,7 +90,7 @@ Hard rule: **only reorganize, rephrase, and emphasize what's already stated or c
 - Photos can supply genuinely new, truthful detail the text omitted — a visible color, a visible finish, a visible included accessory, a clearly visible feature (casters, a power outlet, a second shelf) — but only when it's unambiguous in the image. When you add a detail sourced from a photo rather than the user's own words, say so explicitly when presenting the draft, so the user can verify you read the photo correctly before it goes live.
 - It's fine to reorder for impact (lead with the strongest true selling point), tighten wording, fix awkward phrasing, and make existing facts (dimensions, adjustability, materials, included accessories, visible color/finish) more scannable — that's presentation, not fabrication.
 
-Always present the enriched version as a distinct, labeled alternative alongside the original — the user picks which one gets saved, and can also decline enrichment entirely and keep their own words verbatim.
+Always present the enriched version as a distinct, labeled alternative alongside the original — the user picks which one gets saved, and can also decline enrichment entirely and keep their own words verbatim. Enrichment happens once, on whichever language the user supplied text in; the subsequent Danish/English translation (workflow step 8) is a faithful rendering of that already-settled text into the other language, not a second enrichment pass — the same hard rule (no new facts) applies to translating for exactly the same reason.
 
 ## Memory shape
 

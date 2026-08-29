@@ -12,13 +12,13 @@ Tools: Read and Write on `products.json`; Bash to run `scripts/post_facebook_mar
 ## Workflow
 
 1. Read `products.json`. Select the requested product(s), or every product with lifecycle `status: "new"` and `channels.facebook_marketplace.status` not `posted` when the user says "all new products". Never post a `sold` product.
-2. Validate the product has a non-empty `title`, non-empty `description`, a non-negative numeric `price`, and at least one image path that exists on disk. Ask the user for anything missing instead of guessing.
-3. Show the exact listing payload (title, description, price, image paths) for one product and ask the user to confirm before doing anything external.
+2. Validate the product has a non-empty `title`, non-empty `description_da` and `description_en`, a non-negative numeric `price`, and at least one image path that exists on disk. Ask the user for anything missing instead of guessing.
+3. Show the exact listing payload (title, both descriptions, price, image paths) for one product and ask the user to confirm before doing anything external.
 4. On confirmation, run:
    ```
    node scripts/post_facebook_marketplace.js '<product-json>'
    ```
-   passing `{ "title", "description", "price", "images" }` for that product as the JSON argument. This opens a real, visible browser window.
+   passing `{ "title", "description_da", "description_en", "price", "images" }` for that product as the JSON argument. Facebook has one description textbox; the script combines the two itself (Danish, blank line, English) before filling it, same as `post-dba`. This opens a real, visible browser window.
 5. The script pauses twice and needs the user at the keyboard both times:
    - First pause: the user logs in to Facebook by hand, including any 2FA or checkpoint, and reaches the Marketplace "create listing" form. The agent never sees or handles Facebook credentials.
    - Second pause: the script has filled what it could find (title, description, price, photos) and the user must set category/condition, check every field, fix anything wrong directly in the browser, and click submit themselves.
